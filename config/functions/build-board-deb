@@ -1,0 +1,367 @@
+# Funcions:
+# build_board_deb
+
+## Build board deb package
+build_board_deb() {
+	local pkgname="${LINUX_BOARD_DEB}"
+
+	if [ "$NAMTSO_BOARD" == "Generic" ]; then
+	    warning_msg "Ignore build common packages: $pkgname"
+	    return 0
+	fi
+
+	info_msg "Build board deb: $pkgname"
+
+	local pkgdir="$BUILD_IMAGES/.tmp/${pkgname}_${VERSION}_${DISTRIB_ARCH}"
+	rm -rf $pkgdir
+	mkdir -p $pkgdir/DEBIAN
+
+	board_deb_dependencies=$(echo $PACKAGE_LIST_BOARD_DEPS)
+	board_deb_dependencies=${board_deb_dependencies// /,}
+
+	cat <<-EOF > $pkgdir/DEBIAN/control
+	Package: $pkgname
+	Version: $VERSION
+	Architecture: $DISTRIB_ARCH
+	Maintainer: Namtso <hello@namtso.com>
+	Installed-Size: 1
+	Replaces: alsa-utils, linux-firmware, watchdog, base-files, mpv, zram-config, haveged, initramfs-tools-core, ppp, plymouth
+	Section: kernel
+	Priority: optional
+	Recommends: ${board_deb_dependencies}
+	Depends: bash, linux-base, u-boot-tools, initramfs-tools, fping
+	Description: Fenix tweaks for ${DISTRIBUTION}-${DISTRIB_RELEASE} on $NAMTSO_BOARD
+	EOF
+
+	# Set up pre install script
+	cat <<-EOF > $pkgdir/DEBIAN/preinst
+	#!/bin/bash
+
+	rm -rf /etc/motd
+	rm -rf /etc/update-motd.d/*
+
+	# Disable power management on network manager
+	if [ -f /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf ]; then
+		sed -i 's/wifi.powersave.*/wifi.powersave = 2/' /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf
+	else
+		if [ -d /etc/NetworkManager/conf.d ]; then
+			echo "[connection]" > /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf
+			echo "# Values are 0 (use default), 1 (ignore/don't touch), 2 (disable) or 3 (enable)." >> /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf
+			echo "wifi.powersave = 2" >> /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf
+		fi
+	fi
+
+	# Remove distro unattended-upgrades config
+	[ -f "/etc/apt/apt.conf.d/50unattended-upgrades" ] && rm /etc/apt/apt.conf.d/50unattended-upgrades
+
+	# Remove unused file
+	[ -f /etc/apt/apt.conf.d/02compress-indexes ] && rm /etc/apt/apt.conf.d/02compress-indexes
+
+	# make a backup since we are unconditionally overwriting this on update
+	[ -f "/etc/default/cpufrequtils" ] && cp /etc/default/cpufrequtils /etc/default/cpufrequtils.dpkg-old
+
+	# jammy default using zstd compression, force set initramfs compression to gzip
+	sed -i "s/^COMPRESS=.*/COMPRESS=gzip/" /etc/initramfs-tools/initramfs.conf
+
+	# Workaround for FAT32 /boot partition
+	# exit if we are running chroot
+	if [ "\$(stat -c %d:%i /)" != "\$(stat -c %d:%i /proc/1/root/.)" ]; then exit 0; fi
+
+	check_fs() {
+		boot_device=\$(mountpoint -d /boot)
+
+		for file in /dev/* ; do
+			CURRENT_DEVICE=\$(printf "%d:%d" \$(stat --printf="0x%t 0x%T" \$file))
+			if [[ "\$CURRENT_DEVICE" = "\$boot_device" ]]; then
+				boot_partition=\$file
+				break
+			fi
+		done
+
+		bootfstype=\$(blkid -s TYPE -o value \$boot_partition)
+		if [ "\$bootfstype" = "vfat" ]; then
+			rm -rf /boot/boot.ini
+			rm -rf /boot/extlinux/extlinux.conf
+			rm -rf /boot/uEnv.txt
+			rm -rf /boot/boot.scr
+		fi
+	}
+
+	mountpoint -q /boot && check_fs
+
+	exit 0
+	EOF
+
+	chmod 755 $pkgdir/DEBIAN/preinst
+
+	# Set up post remove script
+	cat <<-EOF > $pkgdir/DEBIAN/postrm
+	#!/bin/bash
+	if [ remove = "\$1" ] || [ abort-install = "\$1" ]; then
+		systemctl disable fenix-zram-config.service fenix-hardware-optimize.service >/dev/null 2>&1
+	fi
+	exit 0
+	EOF
+
+	chmod 755 $pkgdir/DEBIAN/postrm
+
+	# Set up post install script
+	cat <<-EOF > $pkgdir/DEBIAN/postinst
+	#!/bin/bash
+	# fix boot delay "waiting for suspend/resume device"
+	if [ -f "/etc/initramfs-tools/initramfs.conf" ]; then
+		if ! grep --quiet "RESUME=none" /etc/initramfs-tools/initramfs.conf; then
+			echo "RESUME=none" >> /etc/initramfs-tools/initramfs.conf
+		fi
+	fi
+
+	if [ ! -f "/etc/default/fenix-zram-config" ]; then
+		mv /etc/default/fenix-zram-config.dpkg-dist /etc/default/fenix-zram-config
+	fi
+
+	# Bluez looks firmware in /etc/firmware/
+	. /etc/fenix-release
+	ln -sf /lib/firmware /etc/firmware
+
+	if [ "\$BOARD" == "A10-3588" ]; then
+		systemctl enable rockchip-isp.service bluetooth-namtso.service fix-gdm-wayland.service
+	fi
+
+	if [ "\$(stat -c %d:%i /)" != "\$(stat -c %d:%i /proc/1/root/.)" ]; then
+		# In chroot
+		if [ -f /boot/.next ]; then
+			IS_MAINLINE_KERNEL="yes"
+		fi
+	else
+		linux_ver=\`uname -r\`
+		if linux-version compare \$linux_ver ge 6.0; then
+			IS_MAINLINE_KERNEL="yes"
+		fi
+	fi
+
+	if [ "\$IS_MAINLINE_KERNEL" == "yes" ]; then
+		# Mainline linux don't use such scripts now
+		echo "#!/bin/bash" > /usr/local/bin/bluetooth-namtso.sh
+		echo "exit 0" >> /usr/local/bin/bluetooth-namtso.sh
+
+		# Disable deprecated services for mainline kernel
+		[ -f "/lib/systemd/system/bluetooth-namtso.service" ] && rm /lib/systemd/system/bluetooth-namtso.service
+		[ -L "/lib/systemd/system/reboot.target.wants/plymouth-reboot.service" ] && rm /lib/systemd/system/reboot.target.wants/plymouth-reboot.service
+		[ -L "/lib/systemd/system/halt.target.wants/plymouth-halt.service" ] && rm /lib/systemd/system/halt.target.wants/plymouth-halt.service
+		[ -L "/lib/systemd/system/poweroff.target.wants/plymouth-poweroff.service" ] && rm /lib/systemd/system/poweroff.target.wants/plymouth-poweroff.service
+
+		# Update modules
+		[ -f /etc/modules.mainline ] && mv /etc/modules.mainline /etc/modules
+	else
+		# Update modules
+		[ -f /etc/modules.mainlne ] && rm /etc/modules.mainlne
+		[ -f /etc/modules.$LINUX ] && mv /etc/modules.$LINUX /etc/modules
+		# Update modules configs
+		[ -f /etc/modprobe.d/dhd.conf.$LINUX ] && mv /etc/modprobe.d/dhd.conf.$LINUX /etc/modprobe.d/dhd.conf
+		# Remove unused files for legacy kernel
+		[ "\$BOARD" != "A10-3588" ] && [ -f /var/lib/alsa/asound.state ] && rm /var/lib/alsa/asound.state
+		[ -f /var/lib/alsa/asound.state ] && alsactl restore > /dev/null 2>&1
+	fi
+
+	# Fix uEnv.txt
+	rootdev=\$(sed -e 's/^.*root=//' -e 's/ .*\$//' < /proc/cmdline)
+	partition_type=\$(sed -e 's/^.*partition_type=//' -e 's/ .*\$//' < /proc/cmdline)
+	if [ -f /boot/uEnv.txt ]; then
+		sed -i "s/rootdev=root=.*/rootdev=root=\$rootdev/g" /boot/uEnv.txt
+		sed -i "s/partitiontype=partition_type=.*/partitiontype=partition_type=\$partition_type/g" /boot/uEnv.txt
+	fi
+
+	systemctl --no-reload enable fenix-zram-config.service fenix-hardware-optimize.service >/dev/null 2>&1
+
+	# Setup plymouth
+	case "\$1" in
+		configure)
+		update-alternatives \
+			--install /usr/share/plymouth/themes/default.plymouth default.plymouth \
+			/usr/share/plymouth/themes/fenix/fenix.plymouth 150
+
+		ln -fs /usr/share/plymouth/themes/fenix/fenix.plymouth /etc/alternatives/default.plymouth
+
+		if which update-initramfs >/dev/null 2>&1
+		then
+			update-initramfs -u
+		fi
+		;;
+
+		abort-upgrade|abort-deconfigure|abort-remove)
+		;;
+
+		*)
+		echo "\$0 called with unknown argument '\$1'" 1>&2
+		exit 1
+		;;
+	esac
+
+	exit 0
+	EOF
+
+	chmod 755 $pkgdir/DEBIAN/postinst
+
+	# Copy premade common rootfs files
+	rsync -aI $ROOT/archives/filesystem/common/* $pkgdir/
+
+	## Copy board special rootfs files, these files will
+	## overwrite the board common part files.
+	rsync -aI $ROOT/archives/filesystem/special/$NAMTSO_BOARD/* $pkgdir/
+
+	if [ "$DISTRIBUTION" == "Ubuntu" ] && [ "$DISTRIB_TYPE" != "minimal" ]; then
+		# Add fenix repository
+		if [ "$BUILD_TYPE" == "release" ]; then
+			mkdir -p $pkgdir/etc/apt/sources.list.d
+			echo "deb http://dl.namtso.com/repos/${NAMTSO_BOARD,,}/ ${DISTRIB_RELEASE} main" > $pkgdir/etc/apt/sources.list.d/fenix.list
+		fi
+	fi
+
+	# Copy extlinux
+	if [ -f $BOOT_SCRIPTS/extlinux/$EXTLINUX_CONF ]; then
+		mkdir -p $pkgdir/boot/extlinux
+		cp $BOOT_SCRIPTS/extlinux/$EXTLINUX_CONF $pkgdir/boot/extlinux/extlinux.conf
+	fi
+
+	# Copy boot environment
+	if [ -f $BOOT_ENV/$BOOT_ENV_FILE_NEW ]; then
+		cp $BOOT_ENV/$BOOT_ENV_FILE_NEW $pkgdir/boot/uEnv.txt
+	fi
+
+	# Copy boot script for Rockchip platform
+	if [ "$VENDOR" == "Rockchip" ]; then
+		mkdir -p $pkgdir/boot
+		if [ -f $BOOT_SCRIPTS/$BOOT_SCRIPT_BOARD ]; then
+			cp $BOOT_SCRIPTS/$BOOT_SCRIPT_BOARD $pkgdir/boot
+			$UTILS_DIR/mkimage -A arm64 -O linux -T script -C none -a 0 -e 0 -n "$CHIP autoscript" -d $pkgdir/boot/$BOOT_SCRIPT_BOARD $pkgdir/boot/boot.scr
+		fi
+	fi
+
+	# Remove mali_csffw.bin if panfork is disabled
+	if [[ "$NAMTSO_BOARD" == "A10-3588" && "$PANFORK_SUPPORT" != "yes" ]]; then
+		rm $pkgdir/lib/firmware/mali_csffw.bin
+	fi
+
+	# Copy Wi-Fi & BT firmware
+	if [ "$WIFI_MODEL" == "Broadcom" ]; then
+		# Copy Wi-Fi firmware
+		mkdir -p $pkgdir/lib/firmware
+		cp -r $ROOT/archives/hwpacks/wlan-firmware/brcm $pkgdir/lib/firmware/
+
+		# Copy Bluetooth firmware
+		mkdir -p $pkgdir/usr/local/bin
+		mkdir -p $pkgdir/lib/systemd/system
+		cp -r $ROOT/archives/hwpacks/bluez/brcm_patchram_plus-$DISTRIB_ARCH $pkgdir/usr/local/bin/brcm_patchram_plus
+		# Use patched hciattach
+		cp -r $ROOT/archives/hwpacks/bluez/hciattach-$DISTRIB_ARCH $pkgdir/usr/local/bin/hciattach
+	fi
+
+	# Install bmp logo
+	mkdir -p $pkgdir/usr/share/fenix/logo
+	cp $ROOT/archives/logo/bmp/* $pkgdir/usr/share/fenix/logo
+	# Install png logo
+	cp $ROOT/archives/logo/png/*.png $pkgdir/usr/share/fenix/logo
+
+	# Install asound.state for mainline kernel
+	if [ -f $ROOT/archives/filesystem/blobs/asound.state/$NAMTSO_BOARD/asound.state ]; then
+		mkdir -p $pkgdir/var/lib/alsa/
+		cp $ROOT/archives/filesystem/blobs/asound.state/$NAMTSO_BOARD/asound.state $pkgdir/var/lib/alsa/
+	fi
+
+	# HACK for jammy
+	if [ "$DISTRIB_RELEASE" == "jammy" ]; then
+		mv $pkgdir/usr/share/initramfs-tools/scripts/local.jammy $pkgdir/usr/share/initramfs-tools/scripts/local
+	else
+		rm -rf $pkgdir/usr/share/initramfs-tools/scripts/local.jammy
+	fi
+	[ -f $pkgdir/etc/initramfs-tools/modules.$LINUX ] && mv $pkgdir/etc/initramfs-tools/modules.$LINUX $pkgdir/etc/initramfs-tools/modules
+	rm -rf $pkgdir/etc/initramfs-tools/modules.*
+
+	# Generate module load order in initramfs
+	if [ -e $pkgdir/etc/initramfs-tools/modules ]; then
+		module_count=0
+		pre_module=
+		while read -r m; do
+			# Skip empty lines
+			if [ -z "$m" ];  then
+				continue
+			fi
+			# Skip comments - d?ash removes whitespace prefix
+			com=$(printf "%.1s" "${m}")
+			if [ "$com" = "#" ]; then
+				continue
+			fi
+			module_count=$((module_count + 1))
+			if [ $module_count -gt 1 ]; then
+				echo "softdep $m pre: $pre_module" >> $pkgdir/etc/modprobe.d/initramfs-modules-load-order.conf
+			else
+				echo "# Initramfs modules load order" > $pkgdir/etc/modprobe.d/initramfs-modules-load-order.conf
+			fi
+			pre_module=$m
+
+		done < $pkgdir/etc/initramfs-tools/modules
+	fi
+
+	# Trigger uInitrd creation after installation, to apply
+	# /etc/initramfs/post-update.d/99-uboot
+	cat <<-EOF > $pkgdir/DEBIAN/triggers
+	activate update-initramfs
+	EOF
+
+	# configure MIN / MAX speed for cpufrequtils
+	cat <<-EOF > $pkgdir/etc/default/cpufrequtils
+	# WARNING: this file will be replaced on board support package upgrade
+	ENABLE=true
+	MIN_SPEED=$CPUMIN
+	MAX_SPEED=$CPUMAX
+	GOVERNOR=$GOVERNOR
+	EOF
+
+	# Config file
+	cat <<-EOF > $pkgdir/etc/fenix-release
+	# PLEASE DO NOT EDIT THIS FILE
+	BOARD=$NAMTSO_BOARD
+	VENDOR=$VENDOR
+	VERSION=$VERSION
+	ARCH=$DISTRIB_ARCH
+	INITRD_ARCH=arm64
+	INSTALL_TYPE=$INSTALL_TYPE
+	IMAGE_VERSION=$IMAGE_VERSION
+	################ GIT VERSION ################
+	UBOOT_GIT_VERSION=`git -C "$UBOOT_VENDOR_DIR" describe --abbrev=7 --dirty --always --tags 2> /dev/null`
+	LINUX_GIT_VERSION=`git -C "$LINUX_VENDOR_DIR" describe --abbrev=7 --dirty --always --tags 2> /dev/null`
+	FENIX_GIT_VERSION=`git -C "$ROOT" describe --abbrev=7 --dirty --always --tags 2> /dev/null`
+	#############################################
+	EOF
+
+	sed -i '/INSTALL_TYPE/d' $pkgdir/etc/fenix-release
+
+	case $DISTRIB_RELEASE in
+		buster|bullseye)
+			mkdir -p $pkgdir/usr/lib/NetworkManager/conf.d/
+			cp $ROOT/archives/filesystem/bsp/zz-override-wifi-powersave-off.conf $pkgdir/usr/lib/NetworkManager/conf.d/
+			cp $ROOT/archives/filesystem/bsp/10-override-random-mac.conf $pkgdir/usr/lib/NetworkManager/conf.d/
+		;;
+
+		bionic|focal|jammy)
+			mkdir -p $pkgdir/usr/lib/NetworkManager/conf.d/
+			cp $ROOT/archives/filesystem/bsp/zz-override-wifi-powersave-off.conf $pkgdir/usr/lib/NetworkManager/conf.d/
+			cp $ROOT/archives/filesystem/bsp/10-override-random-mac.conf $pkgdir/usr/lib/NetworkManager/conf.d/
+		;;
+
+	esac
+
+	# Add dependencies file
+	cat <<-EOF > $pkgdir/etc/fenix-board-dependencis
+	FENIX_BOARD_DEPENDENCIES="$(echo $PACKAGE_LIST_BOARD_DEPS)"
+	EOF
+
+	# Create board deb file
+	info_msg "Building package: $pkgname"
+	fakeroot dpkg-deb -b -Zxz $pkgdir ${pkgdir}.deb
+	mkdir -p $BUILD_DEBS/$VERSION/$NAMTSO_BOARD/${DISTRIBUTION}-${DISTRIB_RELEASE}
+	cp ${pkgdir}.deb $BUILD_DEBS/$VERSION/$NAMTSO_BOARD/${DISTRIBUTION}-${DISTRIB_RELEASE}
+	# Cleanup
+	rm -rf ${pkgdir}.deb
+	rm -rf $pkgdir
+}

@@ -1,0 +1,5 @@
+#!/bin/bash
+
+. /etc/fenix-release
+
+exit 0

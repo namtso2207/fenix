@@ -1,0 +1,177 @@
+# Funcions:
+# build_desktop_deb
+# desktop_postinstall
+
+## Build desktop deb package
+build_desktop_deb() {
+
+	if [ "$DISTRIB_TYPE" == "server" ] || [ "$DISTRIB_TYPE" == "minimal" ]; then
+		info_msg "Ignore build desktop package for server/minimal images."
+		return 0
+	fi
+
+	desktop_deb_dependencies=$(echo $PACKAGE_LIST_DESKTOP)
+	desktop_deb_dependencies=${desktop_deb_dependencies// /,}
+
+	local pkgname="${FENIX_DESKTOP_DEB}"
+	local pkgdir="$BUILD_IMAGES/.tmp/${pkgname}_${VERSION}_all"
+	rm -rf $pkgdir
+	mkdir -p $pkgdir/DEBIAN
+
+	info_msg "Build desktop deb..."
+
+	cat <<-EOF > $pkgdir/DEBIAN/control
+	Package: $pkgname
+	Version: $VERSION
+	Architecture: all
+	Maintainer: Namtso <hello@namtso.com>
+	Installed-Size: 1
+	Section: xorg
+	Priority: optional
+	Replaces: pulseaudio
+	Recommends: ${desktop_deb_dependencies}
+	Provides: fenix-desktop-package
+	Description: Fenix desktop for ${DISTRIBUTION}-${DISTRIB_RELEASE} on $NAMTSO_BOARD
+	EOF
+
+	# Set up pre install script
+	cat <<-EOF > $pkgdir/DEBIAN/preinst
+	#!/bin/sh
+
+	exit 0
+	EOF
+
+	chmod 755 $pkgdir/DEBIAN/preinst
+
+	# Set up post remove script
+	cat <<-EOF > $pkgdir/DEBIAN/postrm
+	#!/bin/sh
+
+	rm -rf /etc/environment.d/90fenix.conf
+
+	exit 0
+	EOF
+
+	chmod 755 $pkgdir/DEBIAN/postrm
+
+	# Set up post install script
+	cat <<-EOF > $pkgdir/DEBIAN/postinst
+	#!/bin/bash
+
+	# exit if we are running chroot
+	if [ "\$(stat -c %d:%i /)" == "\$(stat -c %d:%i /proc/1/root/.)" ]; then
+		# Updata default configuration
+		[ -d /etc/skel/.config ] && cp -arf /etc/skel/.config /home/namtso
+		[ -d /etc/skel/.local ] && cp -arf /etc/skel/.local /home/namtso
+		chown namtso:namtso /home/namtso/.config -R
+		chown namtso:namtso /home/namtso/.local -R
+		chown root:root /home/
+	fi
+
+	if [ "\$(stat -c %d:%i /)" != "\$(stat -c %d:%i /proc/1/root/.)" ]; then
+		# In chroot
+		if [ -f /boot/.next ]; then
+			IS_MAINLINE_KERNEL="yes"
+		fi
+	else
+		linux_ver=\`uname -r\`
+		if linux-version compare \$linux_ver ge 6.0; then
+			IS_MAINLINE_KERNEL="yes"
+		fi
+	fi
+
+	if [ "\$IS_MAINLINE_KERNEL" == "yes" ]; then
+		[ -f /lib/systemd/system/hdmi_resolution.service ] && rm /lib/systemd/system/hdmi_resolution.service
+		[ -f /home/namtso/.local/share/applications/cpu-frequency-setting.desktop ] && rm /home/namtso/.local/share/applications/cpu-frequency-setting.desktop
+#		[ -f /home/namtso/.local/share/applications/fan-settings.desktop ] && rm /home/namtso/.local/share/applications/fan-settings.desktop
+		[ -f /home/namtso/.local/share/applications/hdmi-resolution-settings.desktop ] && rm /home/namtso/.local/share/applications/hdmi-resolution-settings.desktop
+		[ -f /home/namtso/.local/share/applications/wol-settings.desktop ] && rm /home/namtso/.local/share/applications/wol-settings.desktop
+	else
+		systemctl --no-reload enable hdmi_resolution.service >/dev/null 2>&1
+	fi
+
+	# For GNOME desktop
+	# Set default desktop manager
+	# Mainline kernel using gdm3
+	# Legacy kernel using lightdm
+	if which gnome-session > /dev/null; then
+		if [ "$DISTRIB_RELEASE" != "jammy" ]; then
+			if which gdm3 > /dev/null; then
+				if [ -f /boot/.next ]; then
+					DM=gdm3
+				else
+					DM=lightdm
+				fi
+
+				# Fix Ubuntu 20.04 Gnome desktop for A10-3588
+				if [ "$NAMTSO_BOARD" == "A10-3588" ]; then
+					DM=gdm3
+				fi
+
+				debconf-set-selections <<-EOT
+				gdm3    shared/default-x-display-manager        select  "\${DM}"
+				lightdm shared/default-x-display-manager        select  "\${DM}"
+				EOT
+
+				echo "/usr/sbin/\${DM}" > /etc/X11/default-display-manager
+				DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true dpkg-reconfigure "\${DM}"
+			fi
+		fi
+	fi
+
+	if [ "$DISTRIB_RELEASE" == "jammy" ]; then
+		cat <<-EOT> /etc/environment.d/90fenix.conf
+		SDL_VIDEODRIVER=wayland
+		QT_QPA_PLATFORM=wayland
+		EOT
+		sed -i 's/#WaylandEnable=.*/WaylandEnable=true/g' /etc/gdm3/custom.conf
+		sed -i 's/WaylandEnable=.*/WaylandEnable=true/g' /etc/gdm3/custom.conf
+	fi
+
+	exit 0
+	EOF
+
+	chmod 755 $pkgdir/DEBIAN/postinst
+
+	# Install default configuration for Chromium
+	mkdir -p $pkgdir/etc/fenix
+	[ -f $ROOT/archives/filesystem/blobs/desktop/chromium.conf ] && cp $ROOT/archives/filesystem/blobs/desktop/chromium.conf $pkgdir/etc/fenix
+
+	# Install default desktop settings
+	if [ -d $ROOT/archives/filesystem/blobs/desktop/${DISTRIB_TYPE} ]; then
+		mkdir -p $pkgdir/etc/skel
+		cp -R $ROOT/archives/filesystem/blobs/desktop/${DISTRIB_TYPE}/skel/.config $pkgdir/etc/skel
+		cp -R $ROOT/archives/filesystem/blobs/desktop/${DISTRIB_TYPE}/skel/.local $pkgdir/etc/skel
+		if [ -d $ROOT/archives/filesystem/blobs/desktop/${DISTRIB_TYPE}/skel/$NAMTSO_BOARD/ ]; then
+			cp -R $ROOT/archives/filesystem/blobs/desktop/${DISTRIB_TYPE}/skel/$NAMTSO_BOARD/. $pkgdir/etc/skel
+		fi
+	fi
+
+	# Install icons
+	mkdir -p $pkgdir/etc/fenix/icons
+	cp $ROOT/archives/filesystem/blobs/desktop/icons/* $pkgdir/etc/fenix/icons
+
+	# Install pulseaudio configurations
+	if [ -f $ROOT/archives/filesystem/blobs/desktop/pulseaudio/default.pa.${DISTRIB_RELEASE,,}.${NAMTSO_BOARD,,}.${LINUX} ]; then
+		mkdir -p $pkgdir/etc/pulse
+		cp $ROOT/archives/filesystem/blobs/desktop/pulseaudio/default.pa.${DISTRIB_RELEASE,,}.${NAMTSO_BOARD,,}.${LINUX} $pkgdir/etc/pulse/default.pa
+	fi
+
+	# Add dependencies file
+	cat <<-EOF > $pkgdir/etc/fenix-desktop-dependencis
+	FENIX_DESKTOP_DEPENDENCIES="$(echo $PACKAGE_LIST_DESKTOP)"
+	EOF
+
+	# Create desktop deb file
+	info_msg "Building package: $pkgname"
+	fakeroot dpkg-deb -b -Zxz $pkgdir ${pkgdir}.deb
+	mkdir -p $BUILD_DEBS/$VERSION/$NAMTSO_BOARD/${DISTRIBUTION}-${DISTRIB_RELEASE}
+	cp ${pkgdir}.deb $BUILD_DEBS/$VERSION/$NAMTSO_BOARD/${DISTRIBUTION}-${DISTRIB_RELEASE}
+	# Cleanup
+	rm -rf ${pkgdir}.deb
+	rm -rf $pkgdir
+}
+
+desktop_postinstall() {
+	:
+}

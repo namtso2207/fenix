@@ -1,0 +1,5 @@
+#!/bin/sh
+
+printf "\n"
+printf " * Website:        https://www.namtso.com\n"
+printf "\n"

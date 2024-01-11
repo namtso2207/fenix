@@ -1,0 +1,757 @@
+#!/bin/bash
+# Functions:
+# error_msg
+# warning_msg
+# info_msg
+# time_cal
+# prepare_host
+# mount_chroot
+# umount_chroot
+# install_deb_chroot
+# execute_in_chroot
+# do_umount
+# cleanup
+# check_loop_device
+# prepare_toolchains
+# prepare_packages
+# get_package_list_hash
+# create_sources_list
+# compress_image
+# check_make_params
+# get_available_make_params
+# post_create_image
+# download_rootfs_cache
+# copy_ota_debs
+
+## Print error message
+## $1 - message
+
+error_msg() {
+	local _FILE=${BASH_SOURCE[1]}
+	local _LINE=${BASH_LINENO[0]}
+
+	echo -e "$_FILE:$_LINE" $ERROR "$1"
+}
+
+## Print warning message
+## $1 - message
+warning_msg() {
+	local _FILE=${BASH_SOURCE[1]}
+	local _LINE=${BASH_LINENO[0]}
+	local _FUNC=${FUNCNAME[1]}
+
+    echo -e "$_FILE:$_FUNC:$_LINE" $WARNING "$1"
+}
+
+## Print information message
+## $1 - message
+info_msg() {
+	echo -e $INFO "$1"
+}
+
+## Calculate time
+## $1 - time in seconds
+time_cal() {
+	local min m
+	min=$(($1/60))
+	sec=$(($1-min*60))
+	[ "$min" = 0 ] || m="$min min"
+	echo "Time elapsed: $m $sec sec"
+}
+
+## Prepare host
+## Install essential packages
+broken_(){
+	[ "$1" ] && \
+	error_msg "$1"
+	error_msg "Broken combination => $build_host and $DISTRIB_RELEASE"
+	error_msg "NOTE: can try use \`NO_HOST_CHECK=1 make\`)"
+	return 1
+}
+prepare_host() {
+
+	if [[ $(dpkg --print-architecture) != "amd64" ]]; then
+		error_msg "Your build host architecture is not supported,please use a 'x86-x64' build host."
+		return -1
+	fi
+
+	local build_host=$(sed -ne 's/^VERSION_CODENAME=//p' </etc/os-release)
+	info_msg "Build host: $build_host target: $DISTRIB_RELEASE"
+
+	[ "$NO_HOST_CHECK" ] || {
+		case $build_host in
+		hirsute|bullseye|jammy)
+		## looks like can build all prev system
+		;;
+		focal|buster)
+			case $DISTRIB_RELEASE in
+				hirsute|bullseye) broken_ ;;
+			esac
+		;;
+		bionic)
+			case $DISTRIB_RELEASE in
+#				hirsute|bullseye|focal|buster) broken_ ;;
+				hirsute|bullseye|buster) broken_ ;;
+			esac
+		;;
+		*)
+		broken_ "Build host system not detected"
+		;;
+		esac
+	}
+
+	grep -q i386 <(dpkg --print-foreign-architectures) || (warning_msg "Requires root privileges, please enter your passowrd!" && sudo dpkg --add-architecture i386)
+	if systemd-detect-virt -q -c; then
+		info_msg "Running in container: $(systemd-detect-virt)"
+		# disable apt-cacher unless NO_APT_CACHER=no is not specified explicitly
+		if [[ $NO_APT_CACHER != no ]]; then
+			info_msg "apt-cacher is disabled in containers."
+			NO_APT_CACHER=yes
+		fi
+		CONTAINER_COMPAT="yes"
+		export CONTAINER_COMPAT
+		export NO_APT_CACHER
+
+		if [ $(systemd-detect-virt) == docker ]; then
+			if [ -d ~/toolchains -a ! -d ~/fenix/downloads ]; then
+				info_msg "Copying preinstalled toolchains ..."
+				mkdir -p ~/fenix/downloads
+				cp -r ~/toolchains/* downloads/
+			fi
+			# Walkaround for ccache permissions
+			# i think no need it ????
+			[ "" ] && \
+			if [ -d ~/.ccache ]; then
+				if [ "$(stat -c '%U %G' ~/.ccache/)" != "namtso namtso" ]; then
+					sudo chown namtso:namtso -R ~/.ccache/
+				fi
+			fi
+		fi
+	fi
+
+	# maybe need clean some packages from this list !?
+	local hostdeps="wget ca-certificates device-tree-compiler pv bc lzop zip binfmt-support build-essential ccache debootstrap ntpdate \
+			gawk gcc-arm-linux-gnueabihf qemu-user-static u-boot-tools uuid-dev zlib1g-dev unzip libusb-1.0-0-dev fakeroot \
+			parted pkg-config libncurses5-dev whiptail debian-keyring debian-archive-keyring f2fs-tools libfile-fcntllock-perl rsync libssl-dev \
+			nfs-kernel-server btrfs-progs ncurses-term p7zip-full kmod dosfstools libc6-dev-armhf-cross \
+			curl patchutils liblz4-tool libpython2.7-dev linux-base swig aptly acl \
+			locales ncurses-base pixz dialog systemd-container udev lib32stdc++6 libc6-i386 lib32ncurses5 lib32tinfo5 \
+			bison libbison-dev flex libfl-dev lib32z1 libglib2.0-dev xxd"
+
+	# new fs tools + compression
+	hostdeps="$hostdeps mtools e2tools e2fsprogs file pixz pigz zstd uuid-runtime fdisk"
+	# remove no need it
+	for r in nfs-kernel-server p7zip-full; do
+	hostdeps="${hostdeps/$r/}"
+	done
+
+	# Getting ready for new hosts
+	case $build_host in
+		bionic)
+		hostdeps+=" python libpython-dev"
+		;;
+		*)
+		hostdeps+=" python2 python3"
+		hostdeps="${hostdeps/lib32ncurses5 lib32tinfo5/lib32ncurses6 lib32tinfo6}"
+	esac
+
+
+	# warning: apt-cacher-ng will fail if installed and used both on host and in container/chroot environment with shared network
+	# set NO_APT_CACHER=yes to prevent installation errors in such case
+	[ "$NO_APT_CACHER" = yes ] || hostdeps="$hostdeps apt-cacher-ng"
+
+	local deps=()
+	local installed=$(dpkg-query -W -f '${db:Status-Abbrev}|${binary:Package}\n' '*' 2>/dev/null | grep '^ii' | awk -F '|' '{print $2}' | cut -d ':' -f 1)
+
+	for packet in $hostdeps; do
+		if ! grep -q -x -e "$packet" <<< "$installed"; then deps+=("$packet"); fi
+	done
+
+	if [[ ${#deps[@]} -gt 0 ]]; then
+		info_msg "Installing build dependencies"
+		info_msg "Requires root privileges, please enter your passowrd!"
+		$sudo apt-get update
+		# need sudo -E for silent mode pass env param
+		$sudo apt-get -y --no-install-recommends install "${deps[@]}"
+		$sudo update-ccache-symlinks
+	fi
+
+	# enable arm binary format so that the cross-architecture chroot environment will work
+	mountpoint -q /proc/sys/fs/binfmt_misc/ || \
+		$sudo mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc || \
+			[ -d /sys/module/binfmt_misc ] || {
+				info_msg "Module 'binfmt_misc' not installed, try to install it!"
+				warning_msg "Requires root privileges, please enter your password!"
+				$sudo modprobe -q binfmt_misc || {
+				# FIXME 'binfmt_misc' should be installed on host PC manually
+				systemd-detect-virt -q -c && \
+				error_msg "You are built in container: $(systemd-detect-virt), but the module 'binfmt_misc' is not installed, please exit the container to execute 'sudo modprobe binfmt_misc' on your host PC and try again!"
+				exit -1
+				}
+	}
+
+	test -e /proc/sys/fs/binfmt_misc/qemu-arm || $sudo update-binfmts --enable qemu-arm
+	test -e /proc/sys/fs/binfmt_misc/qemu-aarch64 || $sudo update-binfmts --enable qemu-aarch64
+
+	# python tricks
+	local p m w
+	mkdir -p $BUILD/bin
+	case $PATH in
+		$BUILD/bin:*);;
+		*)export PATH="$BUILD/bin:$PATH";;
+	esac
+	for p in python python2; do
+		which $p 1>/dev/null || \
+		for m in python2 python3; do
+			w=$(which $m)
+			if [ "$w" ]; then
+				echo ln -sf $w $BUILD/bin/$p
+				ln -sf $w $BUILD/bin/$p
+				break
+			fi
+		done
+	printf "[i] check $p -> "
+	$p -V
+	done
+
+}
+
+## Mount chroot
+mount_chroot() {
+	local target=$1
+	if [ -z "$target" ]; then
+		echo "Usage: mount_chroot <target>"
+		return -1
+	fi
+
+	grep -q $target/proc /proc/mounts && return
+
+	#mkdir -p /tmp/fenix # shared path to host system from chroot
+	mount -t proc chproc $target/proc
+	mount -t sysfs chsys $target/sys
+	#mount --bind /tmp/fenix $target/sys/fs # get it from /sys/fs
+	mount -t devtmpfs chdev $target/dev || mount --bind /dev $target/dev
+	mount -t devpts chpts $target/dev/pts
+	# maybe need it
+	mount -t tmpfs chrun $target/run
+	mkdir -p $target/run/lock
+}
+
+qemu_helper() {
+	for c in $QEMU_BINARY; do
+		q=$(which $c)
+		[ -e "$1$q" ] || cp "$q" "$1$q"
+	done
+}
+
+qemu_helper_deactivate() {
+	[ -d "$1" ] || return 1
+	q=$(which $QEMU_BINARY)
+	rm "$1$q"
+}
+
+## notice about need sudo
+need_sudo(){
+if [ "$sudo" ]; then
+    info_msg "[${FUNCNAME[1]}] This script requires root privileges, trying to use sudo, please enter your passowrd!"
+    sudo true || exit
+    info_msg "sudo works..."
+fi
+}
+
+unmount_deep(){
+    [ "$1" = "-v" -o "$1" = "-vv" ] && verbose_=$1 && shift
+    [ "$verbose_" ] && echo "[i] umount_deep $@" >&2
+    # simple deep unmount must works at most of cases ;-)
+    for t in "$@"; do
+	[ -d "$t" ] || continue
+	t_=$(realpath "$t")
+	max_=10
+	while [ $max_ -gt 0 ]; do
+	    mounted_=$(egrep -o "\s+$t_\S*" /proc/mounts 2>/dev/null | sort -r | uniq || true)
+	    [ ${#mounted_} = 0 ] && break
+	    [ "$verbose_" = "-vv" ] && echo "[i] umount($max_) " $mounted_ >&2
+	    msg_=$($sudo umount -v -R $mounted_ 2>&1 || echo ERROR)
+	    max_=$((max_-1))
+	done
+
+	[ $max_ = 0 ] && {
+	    #egrep -m1 -o "\s+$t_\s+" /proc/mounts && {
+	    error_msg "[e] umount_deep $@ - $msg_"
+	    return -1
+	}
+
+    done
+    return 0
+}
+
+## Umount chroot
+umount_chroot() {
+	unmount_deep "$1"
+}
+
+## Install debs in chroot
+install_deb_chroot()
+{
+	local package=$1
+	local name=$(basename $package)
+	[ -e "$package" ] || {
+	    warning_msg "Installing $name in chroot skipped (not exist)"
+	    return 0
+	}
+	cp $package $ROOTFS_TEMP/root/$name
+	info_msg "Installing $name in chroot..."
+	mount_chroot "$ROOTFS_TEMP"
+	chroot $ROOTFS_TEMP /bin/bash -c "dpkg -i /root/$name" || exit 1
+	umount_chroot "$ROOTFS_TEMP"
+	rm -f $ROOTFS_TEMP/root/$name
+}
+
+## Umount
+do_umount() {
+    warning_msg  "do_unmount: - $1"
+	if mount | grep $1 > /dev/null; then
+		umount $1
+    fi
+}
+
+# Execute command in chroot
+execute_in_chroot() {
+	local cmd=$1
+	[ "$cmd" ] || {
+	    error_msg "Command required!"
+	    return 1
+	}
+	info_msg "Executing '$cmd' in chroot..."
+	mount_chroot "$ROOTFS_TEMP"
+	LC_ALL=C LANG=C chroot $ROOTFS_TEMP /bin/bash -c "$cmd"
+	umount_chroot "$ROOTFS_TEMP"
+}
+
+## Cleanup
+cleanup() {
+    cd $ROOT
+    echo "Cleanup..."
+    sync
+
+    trap - INT TERM EXIT
+
+    unmount_deep "$ROOTFS_TEMP" "$ROOTFS"
+}
+
+# Check & Create loop device if not exist
+check_loop_device()
+{
+	local device=$1
+
+	PARTITIONS=$(lsblk --raw --output "MAJ:MIN" --noheadings ${device} | tail -n +2)
+	COUNTER=1
+	for i in $PARTITIONS; do
+		MAJ=$(echo $i | cut -d: -f1)
+		MIN=$(echo $i | cut -d: -f2)
+		if [ ! -e "${device}p${COUNTER}" ]; then
+			if [ "$CONTAINER_COMPAT" == "yes" ]; then
+				warning_msg "Creating device node: ${device}p${COUNTER}"
+				mknod ${device}p${COUNTER} b $MAJ $MIN
+			else
+				error_msg "Device node $device does not exist!"
+				return -1
+			fi
+		fi
+		COUNTER=$((COUNTER + 1))
+	done
+}
+
+## Prepare toolhains
+prepare_toolchains() {
+
+	build_package "gcc-linaro-aarch64-linux-gnu:host"
+	build_package "gcc-linaro-aarch64-none-elf:host"
+	build_package "gcc-linaro-aarch64-elf:host"
+	build_package "gcc-arm-aarch64-none-linux-gnu:host"
+	build_package "gcc-arm-aarch64-none-linux-gnu-mainline:host"
+
+	return 0
+}
+
+## Prepare packages
+prepare_packages() {
+
+    build_package "utils:host"
+    build_package "images_upgrade:host"
+
+	if [ "$VENDOR" == "Rockchip" ]; then
+		build_package "rkbin:host"
+	fi
+}
+
+## returns md5 hash for current package list
+get_package_list_hash()
+{
+	package_list=$(echo $(
+	printf '%s\n' $PACKAGE_LIST | sort -u
+	echo -
+	printf '%s\n' $PACKAGE_LIST_EXCLUDE | sort -u
+	echo =
+	echo $ROOTFSCACHE_VERSION
+	))
+
+	md5_=$(echo $package_list | md5sum)
+	md5_=${md5_:0:7}
+#	echo "PKG_LIST_HASH: $md5_ : $package_list">&2
+	echo $md5_
+}
+
+## create_sources_list <release> <basedir>
+##
+## <release>: buster|bullseye|bionic|focal|jammy
+## <basedir>: path to root directory
+create_sources_list()
+{
+	local release=$1
+	local basedir=$2
+	[[ -z $basedir ]] && error_msg "No basedir passed to create_sources_list" && return -1
+
+	local security=
+	case $release in
+	bullseye)
+	security="-security"
+	esac
+
+	case $release in
+	buster|bullseye)
+	cat <<-EOF | tee $basedir/etc/apt/sources.list
+	deb http://${DEBIAN_MIRROR} $release main contrib non-free
+	#deb-src http://${DEBIAN_MIRROR} $release main contrib non-free
+
+	deb http://${DEBIAN_MIRROR} ${release}-updates main contrib non-free
+	#deb-src http://${DEBIAN_MIRROR} ${release}-updates main contrib non-free
+
+	deb http://${DEBIAN_MIRROR} ${release}-backports main contrib non-free
+	#deb-src http://${DEBIAN_MIRROR} ${release}-backports main contrib non-free
+
+	deb http://security.debian.org/ ${release}$security/updates main contrib non-free
+	#deb-src http://security.debian.org/ ${release}/updates main contrib non-free
+	EOF
+	;;
+
+	bionic|focal|hirsute|jammy)
+	cat <<-EOF | tee $basedir/etc/apt/sources.list
+	deb http://${UBUNTU_MIRROR} $release main restricted universe multiverse
+	#deb-src http://${UBUNTU_MIRROR} $release main restricted universe multiverse
+
+	deb http://${UBUNTU_MIRROR} ${release}-security main restricted universe multiverse
+	#deb-src http://${UBUNTU_MIRROR} ${release}-security main restricted universe multiverse
+
+	deb http://${UBUNTU_MIRROR} ${release}-updates main restricted universe multiverse
+	#deb-src http://${UBUNTU_MIRROR} ${release}-updates main restricted universe multiverse
+
+	deb http://${UBUNTU_MIRROR} ${release}-backports main restricted universe multiverse
+	#deb-src http://${UBUNTU_MIRROR} ${release}-backports main restricted universe multiverse
+	EOF
+	;;
+	esac
+}
+
+## compress_image
+compress_image() {
+	[[ $COMPRESS_IMAGE != yes ]] && return
+
+	echo ""
+	info_msg "Compressing image '$BUILD_IMAGES/$IMAGE_FILE_NAME' to '$BUILD_IMAGES/$IMAGE_FILE_NAME.xz' ..."
+
+	rm -rf "$BUILD_IMAGES/$IMAGE_FILE_NAME.xz"
+
+	# simple minimal progress
+	[ "$NO_PROGRESS" ] && {
+		P_=$$
+		(
+		    i_=0;d_=5
+		    while [ -d /proc/$P_ ]; do
+		    sleep $d_
+		    [ -e "$BUILD_IMAGES/$IMAGE_FILE_NAME.xz" ] || break
+		    i_=$((i_+d_))
+		    printf "[compress %03d] %s %s\n" "$i_" "$IMAGE_FILE_NAME.xz" \
+			"$(stat -c%s "$BUILD_IMAGES/$IMAGE_FILE_NAME.xz")"
+		    done
+		)&
+		BGM=$!
+	}
+
+	if [ "$INSTALL_TYPE" == "SD-USB" -o "$INSTALL_TYPE_RAW" == "yes" ]; then
+		if [ "$1" == "uboot-image" ]; then
+			label="Uboot"
+			desc="Uboot $VERSION minimal - fenix generated images https://github.com/namtso/fenix"
+		else
+			label="$DISTRIBUTION"
+			desc="$DISTRIBUTION $VERSION $DISTRIB_TYPE $DISTRIB_RELEASE - fenix generated images https://github.com/namtso/fenix"
+		fi
+
+
+		"$ROOT"/scripts/xze "$BUILD_IMAGES/$IMAGE_FILE_NAME" \
+		    --meta \
+		    LABEL="$label" \
+		    BOARD="$NAMTSO_BOARD" \
+		    BUILDER="fenix" \
+		    LINK="https://dl.namtso.com/" \
+		    DESC="$desc" \
+		    > "$BUILD_IMAGES/$IMAGE_FILE_NAME.xz"
+	else
+		"$ROOT"/scripts/xze "$BUILD_IMAGES/$IMAGE_FILE_NAME" > "$BUILD_IMAGES/$IMAGE_FILE_NAME.xz"
+	fi
+
+	[ "$BGM" ] && kill $BGM
+
+	[ "$NO_KEEP_IMAGE" ] && {
+	    info_msg "NO_KEEP_IMAGE (remove original): $IMAGE_FILE_NAME"
+	    rm "$BUILD_IMAGES/$IMAGE_FILE_NAME"
+	}
+
+	echo ""
+	info_msg "COMPRESSED IMAGE: ${GREEN} $BUILD_IMAGES/$IMAGE_FILE_NAME.xz ${ENDCOLOR} is ready!"
+}
+
+## check_make_params
+check_make_params() {
+	echo ""
+	for param in $MAKE_PARAMS
+	do
+		printf "${BOLDCYAN}%-30s:${ENDCOLOR}${BOLDGREEN}%10s${ENDCOLOR}\n" $param ${!param}
+	done
+	echo ""
+}
+
+## get_available_make_params
+get_available_make_params() {
+	echo ""
+	printf "${BOLDYELLOW}%-30s${ENDCOLOR}${BOLDYELLOW}%15s${ENDCOLOR}\n" "Parameter" "Value"
+	printf "=========================================================\n"
+	for param in $MAKE_PARAMS
+	do
+		key=$param
+		value=${param}_VALUES
+		printf "${BOLDCYAN}%-30s:${ENDCOLOR}${BOLDGREEN}%20s${ENDCOLOR}\n" "$key" "${!value}"
+	done
+	echo ""
+}
+
+fix_perms(){
+	# fix files perm for original user
+	[ -e "$1" ] || return 0
+	#info_msg "fix_perms_check: $1 [$UID:$UID]"
+	
+	if [ "$SUDO_UID" ]; then
+	    find "$1" ! -user $SUDO_UID -exec chown $SUDO_UID:$SUDO_GID {} \;
+	    return
+	else
+	    if find "$1" ! -user $UID | grep -q -m1 "" ; then
+		info_msg "fix_perms: $1 [$UID:$UID]"
+		$sudo chown -R $UID:$UID "$1"
+	    fi
+	    return
+	fi
+	return 0
+}
+
+clean_old_session(){
+    info_msg "Cleanup old build session"
+    unmount_deep "$BUILD_IMAGES"
+    for l in "$ROOTFS" "$BUILD_IMAGES"/.tmp; do
+	if [ -e "$l" ]; then
+	    info_msg "Cleanup: $l"
+	    $sudo rm -rf $l
+	fi
+    done
+    fix_perms "$BUILD_IMAGES"
+}
+
+## post create image customization
+## USAGE: CUSTOM_SCRIPT=.works/custom.sh make image
+
+custom_script(){
+    [ -x "$CUSTOM_SCRIPT" ] && {
+    echo "custom_script: $CUSTOM_SCRIPT $IMAGE_FILE_NAME $ROOTFS "
+
+    IMAGE_FILE_NAME=$IMAGE_FILE_NAME \
+    BUILD_IMAGES=$BUILD_IMAGES \
+    ROOTFS=$ROOTFS \
+    $CUSTOM_SCRIPT
+    return
+    }
+    return 0
+}
+
+## post_create_image
+post_create_image() {
+
+	# cleanup
+	# add some safety ;-) before make rm -rf
+	unmount_deep "$ROOTFS" "$BUILD_IMAGES"/.tmp
+
+	rm -rf "$BUILD_IMAGES"/.tmp
+
+	fix_perms "$BUILD_IMAGES"
+
+	custom_script
+
+	# upload images
+
+	if [ "$UPLOAD_SCRIPT" -a -x "$UPLOAD_SCRIPT" ]; then
+	    echo BUILD_IMAGES="$BUILD_IMAGES" \
+	    IMAGE_FILE_NAME="$IMAGE_FILE_NAME" \
+	    CREATE_ROOTFS_CACHE_ONLY="$CREATE_ROOTFS_CACHE_ONLY" \
+	    "$UPLOAD_SCRIPT"
+
+	    BUILD_IMAGES="$BUILD_IMAGES" \
+	    IMAGE_FILE_NAME="$IMAGE_FILE_NAME" \
+	    CREATE_ROOTFS_CACHE_ONLY="$CREATE_ROOTFS_CACHE_ONLY" \
+	    "$UPLOAD_SCRIPT"
+	    return
+	fi
+
+	if [ "$UPLOAD" -a -d "$UPLOAD" ]; then
+	    for f in "$BUILD_IMAGES/"$IMAGE_FILE_NAME*; do
+		if [ -e "$f" ]; then
+		    info_msg "UPLOAD : $f to $UPLOAD"
+		    if [ "$SUDO_UID" ]; then
+			sudo -u $SUDO_USER mv "$f" "$UPLOAD"
+		    else
+			mv "$f" "$UPLOAD"
+		    fi
+		fi
+	    done
+	fi
+}
+
+check_active_session(){
+    info_msg "Check active build session $FPID [$$]"
+    APID=$(pgrep -F "$FPID" 2>/dev/null || true)
+    if [ "$APID" ]; then
+	error_msg "Prev build session detected: $APID"
+	ps $APID
+	return 2
+    fi
+    echo $$ > $FPID && {
+	info_msg "Start new build session $FPID [$$]"
+    }
+    return
+}
+
+check_busy_files(){
+    info_msg "Check busy files: $@"
+    for c in "$@"; do
+    if [ -d "$c" ]; then
+	need_sudo || true
+	prev=$($sudo lsof 2>&1 | grep -m1 "$c" || true)
+	[ "${#prev}" -gt 0 ] && {
+	    error_msg "$c busy\n$prev\n"
+	    return 1
+	}
+    fi
+    done
+    return 0
+}
+
+## download_rootfs_cache
+download_rootfs_cache() {
+	local cache_name=$1
+	local cache_url=$ROOTFS_CACHE_URL/$cache_name
+	local wget_cmd
+
+	mkdir -p $BUILD_IMAGES/cache/rootfs
+	cd $BUILD_IMAGES/cache/rootfs
+
+	wget_cmd="wget --timeout=30 --tries=3 --passive-ftp --no-check-certificate -O "
+
+	if [ ! -f ${cache_name}.download_complete ]; then
+		rm -rf $cache_name ${cache_name}.sha256
+	fi
+
+	# Check rootfs cache checksum
+	if ! `timeout 10 curl --head --fail --silent ${cache_url}.sha256 2>&1 >/dev/null`; then
+		warning_msg "Can't find rootfs cache checksum ${cache_name}.sha256 on server! Create it from scratch!"
+		return 255
+	fi
+
+	# Download rootfs cache checksum
+	local count=10
+	while [ $count -gt 0 ]; do
+		rm -rf ${cache_name}.sha256
+
+		if $wget_cmd "${cache_name}.sha256" "${cache_url}.sha256"; then
+			fix_perms "${cache_name}.sha256"
+			break
+		fi
+		count=$((count - 1))
+	done
+
+	if [ $count -eq 0 ]; then
+		error_msg "Cant't get $cache_name checksum : ${cache_name}.sha256\n Try later !!"
+		return -1
+	else
+		echo "Cache $cache_name checksum is: `cat ${cache_name}.sha256`"
+	fi
+
+	# Check rootfs cache checksum
+	if ! `timeout 10 curl --head --fail --silent ${cache_url} 2>&1 >/dev/null`; then
+		warning_msg "Can't find rootfs cache ${cache_name} on server! Create it from scratch!"
+		return 255
+	fi
+
+	# Download rootfs cache
+	count=10
+	while [ $count -gt 0 ]; do
+		rm -rf $cache_name
+
+		if $wget_cmd "$cache_name" "$cache_url"; then
+		    calc_sha256="$(sha256sum $cache_name | cut -d" " -f1)"
+		    [ `cat ${cache_name}.sha256` == "${calc_sha256}" ] && break
+
+		    error_msg "Incorrect checksum calculated on downloaded file: got ${calc_sha256}, wanted `cat ${cache_name}.sha256`"
+			rm -rf $cache_name
+		fi
+		count=$((count - 1))
+	done
+
+	if [ $count -eq 0 ]; then
+		error_msg "Cant't get $cache_name cache : $cache_url\n Try later !!"
+		return -1
+	else
+		fix_perms "$cache_name"
+		echo "Calculated checksum is: ${calc_sha256}"
+		touch ${cache_name}.download_complete
+		fix_perms "${cache_name}.download_complete"
+	fi
+}
+
+## Copy OTA Debian Packages to Corresponding Folder
+copy_ota_debs() {
+
+	local ota_debs=$BUILD_DEBS/$VERSION/ota_debs
+
+	if [ "$NAMTSO_BOARD" == "Generic" ]; then
+		warning_msg "Ignore copy ota debian packages!"
+		return
+	fi
+
+	info_msg "Copying debs to $ota_debs/$NAMTSO_BOARD/$DISTRIBUTION-$DISTRIB_RELEASE ..."
+
+	mkdir -p $ota_debs/$NAMTSO_BOARD/$DISTRIBUTION-$DISTRIB_RELEASE
+	rm -rf $ota_debs/$NAMTSO_BOARD/$DISTRIBUTION-$DISTRIB_RELEASE/*
+	cd $ota_debs
+
+	cp ../$NAMTSO_BOARD/*.deb $NAMTSO_BOARD/$DISTRIBUTION-$DISTRIB_RELEASE
+	[ -d ../$NAMTSO_BOARD/mali-debs ] && find ../$NAMTSO_BOARD/mali-debs -iname "*.deb" -type f -exec cp {} $NAMTSO_BOARD/$DISTRIBUTION-$DISTRIB_RELEASE \; || true
+	find ../$NAMTSO_BOARD/$DISTRIBUTION-$DISTRIB_RELEASE -iname "*.deb" -type f -exec cp {} $NAMTSO_BOARD/$DISTRIBUTION-$DISTRIB_RELEASE \;
+	(
+	cd $NAMTSO_BOARD/$DISTRIBUTION-$DISTRIB_RELEASE
+	for deb in `ls [0-9][0-9]-*.deb 2> /dev/null`
+	do
+		new_deb=${deb:3}
+		info_msg "Renaming $deb to $new_deb"
+		mv $deb $new_deb
+	done
+	)
+
+	cd - > /dev/null
+}

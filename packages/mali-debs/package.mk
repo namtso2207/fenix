@@ -1,0 +1,23 @@
+PKG_NAME="mali-debs"
+PKG_VERSION="6361843c8aa6571fb62842282f5ce9f4a78d59d9"
+PKG_SHA256="62f6f9cdaa186175ee488a869804f5f8d01b9ca5120a4970960c07e213c8c168"
+PKG_SOURCE_DIR="${PKG_NAME}-${PKG_VERSION}*"
+PKG_SITE="$GITHUB_URL/numbqq/${PKG_NAME}"
+PKG_URL="$PKG_SITE/archive/$PKG_VERSION.tar.gz"
+PKG_ARCH="arm aarch64"
+PKG_LICENSE="GPL"
+PKG_SHORTDESC="Mali Libraries"
+PKG_SOURCE_NAME="${PKG_NAME}-${PKG_VERSION}.tar.gz"
+PKG_NEED_BUILD="NO"
+
+
+make_target() {
+	:
+}
+
+makeinstall_target() {
+	mkdir -p $BUILD_DEBS/$VERSION/$NAMTSO_BOARD/mali-debs
+	# Remove old debs
+	rm -rf $BUILD_DEBS/$VERSION/$NAMTSO_BOARD/mali-debs/*
+	[ -d ${DISTRIB_RELEASE}/${DISTRIB_ARCH}/${NAMTSO_BOARD} ] && cp -r ${DISTRIB_RELEASE}/${DISTRIB_ARCH}/${NAMTSO_BOARD}/* $BUILD_DEBS/$VERSION/$NAMTSO_BOARD/mali-debs || true
+}

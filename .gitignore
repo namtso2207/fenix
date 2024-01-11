@@ -1,0 +1,28 @@
+#
+# Normal rules
+#
+.*
+*.orig
+*~
+\#*#
+
+!.dockerignore
+!.github
+
+# Git repos
+/linux
+/u-boot
+/rootfs
+/utils
+
+# Images
+/images
+
+/build
+/downloads
+/boot
+
+*.changes
+*.buildinfo
+
+/*.patch
