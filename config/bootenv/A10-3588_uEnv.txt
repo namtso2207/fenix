@@ -9,3 +9,6 @@ fan_mode=auto
 ## e.g. Add bootargs 'test1=111 test2=222'
 ## boot_user_args=test1=111 test2=222
 boot_user_args=
+
+## set wifi
+wifi=off
