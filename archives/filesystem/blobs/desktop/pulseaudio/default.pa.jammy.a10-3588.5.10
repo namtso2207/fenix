@@ -153,6 +153,6 @@ load-module module-filter-apply
 .include /etc/pulse/default.pa.d
 
 # Set default sink
-set-default-sink alsa_output.platform-hdmi0-sound.stereo-fallback
+set-default-sink alsa_output.platform-hdmi1-sound.stereo-fallback
 # Set default source
-set-default-source alsa_input.platform-sound-micarray.stereo-fallback
+set-default-source alsa_input.platform-es8316-sound.stereo-fallback
