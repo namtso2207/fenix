@@ -29,8 +29,8 @@ fi
 DEFAULT_FAN_MODE=${fan_mode}
 
 if [ ${LINUX_VER::4} == "5.10" ];then
-	LIST_MENU=(off low mid high auto)
-	LIST_MENU_VALUE=(FALSE FALSE FALSE FALSE FALSE)
+	LIST_MENU=(off lowest low mid high highest auto)
+	LIST_MENU_VALUE=(FALSE FALSE FALSE FALSE FALSE FALSE FALSE)
 else
 	LIST_MENU=(manual auto)
 	LIST_MENU_VALUE=(FALSE FALSE)
@@ -59,7 +59,9 @@ selected_mode=$(zenity --height=275 \
 				${LIST_MENU_VALUE[1]} ${LIST_MENU[1]} \
 				${LIST_MENU_VALUE[2]} ${LIST_MENU[2]} \
 				${LIST_MENU_VALUE[3]} ${LIST_MENU[3]} \
-				${LIST_MENU_VALUE[4]} ${LIST_MENU[4]})
+				${LIST_MENU_VALUE[4]} ${LIST_MENU[4]} \
+				${LIST_MENU_VALUE[5]} ${LIST_MENU[5]} \
+				${LIST_MENU_VALUE[6]} ${LIST_MENU[6]})
 else
 selected_mode=$(zenity --height=275 \
 				--list --radiolist \
