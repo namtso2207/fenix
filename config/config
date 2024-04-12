@@ -352,8 +352,8 @@ UBUNTU_MIRROR='ports.ubuntu.com/'
 ROOTFS_CACHE_URL="http://build.namtso.com/namtso/fenix/cache/rootfs"
 
 ## U-boot & Linux GitHub URL
-LINUX_SOURCE_URL="${LINUX_SOURCE_URL:-https://github.com/namtso/linux}"
-UBOOT_SOURCE_URL="${UBOOT_SOURCE_URL:-https://github.com/namtso/u-boot}"
+LINUX_SOURCE_URL="${LINUX_SOURCE_URL:-https://github.com/namtso2207/linux}"
+UBOOT_SOURCE_URL="${UBOOT_SOURCE_URL:-https://github.com/namtso2207/u-boot}"
 
 if [[ $DOWNLOAD_MIRROR == china ]] ; then
 	DEBIAN_MIRROR='mirrors.tuna.tsinghua.edu.cn/debian'
