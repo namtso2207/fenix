@@ -12,4 +12,10 @@
 /usr/sbin/rfkill unblock 0
 /bin/sleep 1
 
-/usr/local/bin/hciattach -n -s 115200 /dev/ttyS6 bcm43xx 1500000
+while [ true ]
+do
+        if ! pidof hciattach > /dev/null; then
+                /usr/local/bin/hciattach -n -s 115200 /dev/ttyS6 bcm43xx 1500000
+        fi
+        sleep 2
+done

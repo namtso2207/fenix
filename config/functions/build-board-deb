@@ -124,7 +124,7 @@ build_board_deb() {
 	ln -sf /lib/firmware /etc/firmware
 
 	if [ "\$BOARD" == "A10-3588" ]; then
-		systemctl enable rockchip-isp.service bluetooth-namtso.service fix-gdm-wayland.service
+		systemctl enable rockchip-isp.service bluetooth-namtso.service fix-gdm-wayland.service bluetooth-suspend.service
 	fi
 
 	if [ "\$(stat -c %d:%i /)" != "\$(stat -c %d:%i /proc/1/root/.)" ]; then
@@ -146,6 +146,7 @@ build_board_deb() {
 
 		# Disable deprecated services for mainline kernel
 		[ -f "/lib/systemd/system/bluetooth-namtso.service" ] && rm /lib/systemd/system/bluetooth-namtso.service
+		[ -f "/lib/systemd/system/bluetooth-suspend.service" ] && rm /lib/systemd/system/bluetooth-suspend.service
 		[ -L "/lib/systemd/system/reboot.target.wants/plymouth-reboot.service" ] && rm /lib/systemd/system/reboot.target.wants/plymouth-reboot.service
 		[ -L "/lib/systemd/system/halt.target.wants/plymouth-halt.service" ] && rm /lib/systemd/system/halt.target.wants/plymouth-halt.service
 		[ -L "/lib/systemd/system/poweroff.target.wants/plymouth-poweroff.service" ] && rm /lib/systemd/system/poweroff.target.wants/plymouth-poweroff.service
