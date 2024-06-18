@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 RC=0
 FAN_INPUT="${1:-"boot"}"
